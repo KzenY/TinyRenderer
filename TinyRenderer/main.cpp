@@ -1,5 +1,6 @@
 ﻿#include <vector>
 #include <iostream>
+#include <fstream>
 #include "tgaimage.h"
 #include "model.h"
 #include <Eigen/Dense>
@@ -8,15 +9,16 @@
 Model* model = NULL;
 const int width = 800;
 const int height = 800;
-
-Vec3f light_dir(1, -1, 1);
+const float depth = 2000.f;
+float* shadowbuffer = NULL;
+Eigen::Matrix4f M;
+//法向量变换矩阵
+Eigen::Matrix4f M_IT;
+Eigen::Matrix4f M_Shadow;
+Vec3f light_dir(-1, 1, 1);
 Vec3f       eye(0, 1, 3);
 Vec3f    center(0, 0, 0);
 Vec3f        up(0, 1, 0);
-
-Eigen::Matrix4f M_View = lookat(eye, center, up);
-Eigen::Matrix4f M_Viewport = viewport(width / 8, height / 8, width * 3 / 4, height * 3 / 4);
-Eigen::Matrix4f M_Projection = projection(-1.f / (eye - center).norm());
 
 struct GouraudShader : public Shader {
 	Eigen::Matrix<float, 2, 3> varying_uv;
@@ -46,14 +48,31 @@ struct GouraudShader : public Shader {
 	}
 };
 
+struct DepthShader :public Shader { 
+	Eigen::Matrix3f tri;
+
+	DepthShader() : tri() {}
+
+	virtual Vec4f vertex(int iface, int nthvert) {
+		Vec4f gl_Vertex = (model->vert(iface, nthvert)).homogeneous();
+		gl_Vertex = M_Viewport * M_Projection * M_View * gl_Vertex;
+		tri.col(nthvert) = (gl_Vertex / gl_Vertex[3]).head<3>();
+		return gl_Vertex;
+	}
+	virtual bool fragment(Vec3f bar, TGAColor& color) {
+		Vec3f p = tri * bar;
+		color = TGAColor(255, 255, 255) * (2.f * p[2] / depth);
+		return false;
+	}
+
+};
+
 struct PhongShader :public Shader {
 	Eigen::Matrix<float, 2, 3> varying_uv;
 	Eigen::Matrix3f tri;
+	Eigen::Matrix3f ndc_tri;
 	Eigen::Matrix3f varying_norm;
-	Eigen::Matrix4f M = M_Projection * M_View;
-	//法向量变换矩阵
-	Eigen::Matrix4f M_IT = M.inverse().transpose();
-	float ambient = 0.1;
+	float ambient = 0.2;
 	float diff;
 	float spec;
 
@@ -66,14 +85,27 @@ struct PhongShader :public Shader {
 		varying_norm.col(nthvert) = (M_IT * model->normal(iface, nthvert).homogeneous()).head<3>();
 		//世界空间顶点
 		tri.col(nthvert) = (M * gl_Vertex).head<3>();
-		return  M_Viewport * M_Projection * M_View * gl_Vertex;
+		//ndc顶点
+		gl_Vertex = M_Viewport * M_Projection * M_View * gl_Vertex;
+		ndc_tri.col(nthvert) = (gl_Vertex/gl_Vertex[3]).head<3>();
+		return  gl_Vertex;
 	}
 
 	virtual bool fragment(Vec3f bar, TGAColor& color) {
-		//插值
+		//framebuffer screen变换到shadowbuffer screen
+		Vec4f p = M_Shadow * ((ndc_tri * bar).homogeneous());
+		//齐次处理
+		p =p / p[3];
+		//ndc
+		int idx = int(p[0]) + int(p[1]) * width;
+		float shadow=.3 + .7 * (shadowbuffer[idx] < p[2]+72.27);
+
+
 		Vec2f uv = varying_uv * bar;
+		//插值顶点法向
 		Vec3f bn = (varying_norm * bar).normalized();
 
+		//构建TBN矩阵
 		Vec3f P1 = tri.col(1) - tri.col(0);
 		Vec3f P2 = tri.col(2) - tri.col(0);
 
@@ -84,7 +116,7 @@ struct PhongShader :public Shader {
 		Vec3f B = (P2 * uv1[0] - P1 * uv2[0]) / (uv1[0] * uv2[1] - uv2[0] * uv1[1]);
 		Vec3f t_ = T - (T.dot(bn)) * bn;
 		t_.normalize();
-		Vec3f b_ = B - B.dot(bn) * bn - B.dot(t_) * t_;
+		Vec3f b_ = t_.cross(bn);
 		b_.normalize();
 		Eigen::Matrix3f M_tbn;
 		M_tbn.col(0) = t_;
@@ -104,34 +136,78 @@ struct PhongShader :public Shader {
 		//半程向量
 		Vec3f h = (v + l).normalized();
 		spec = pow(std::max(h.dot(n), 0.f), model->specular(uv));
-		float intensity = ambient + diff + .6f * spec;
-		color = model->diffuse(uv) * intensity;
+		float glow = model->glow(uv);
+		float intensity = ambient + diff + spec+1.2f * glow;
+		TGAColor c = model->diffuse(uv);
+		for (int i = 0; i < 3; i++) color[i] = std::min<float>(c[i] * shadow * intensity, 255);
 		return false;
 	}
 };
+
 
 int main(int argc, char** argv) {
 	if (2 == argc) {
 		model = new Model(argv[1]);
 	}
 	else {
-		model = new Model("obj/african_head.obj");
+		model = new Model("obj/diablo3_pose/diablo3_pose.obj");
 	}
 
-	TGAImage image(width, height, TGAImage::RGB);
-	TGAImage zbuffer(width, height, TGAImage::GRAYSCALE);
+	float* zbuffer = new float[width * height];
+	shadowbuffer = new float[width * height];
 
-	PhongShader shader;
-	for (int i = 0; i < model->nfaces(); i++) {
+	for (int i = width * height; --i; ) {
+		zbuffer[i] = shadowbuffer[i] = -std::numeric_limits<float>::max();
+	}
+
+	light_dir.normalize();
+
+	//rendering the shadow buffer
+	{
+		TGAImage depth(width, height, TGAImage::RGB);
+		//对比frame buffer的lookat矩阵，相机位置替代光源位置
+		lookat(light_dir, center, up);
+		viewport(width / 8, height / 8, width * 3 / 4, height * 3 / 4);
+		projection(0.f);
+		DepthShader depthshader;
 		Vec4f screen_coords[3];
-		for (int j = 0; j < 3; j++) {
-			screen_coords[j] = shader.vertex(i, j);
+		for (int i = 0; i < model->nfaces(); i++) {
+			for (int j = 0; j < 3; j++) {
+				screen_coords[j] = depthshader.vertex(i, j);
+			}
+			triangle(screen_coords, depthshader, depth, shadowbuffer);
 		}
-		triangle(screen_coords, shader, image, zbuffer);
+		depth.flip_vertically();
+		depth.write_tga_file("depth.tga");
 	}
 
-	image.flip_vertically();
-	image.write_tga_file("Phong_7.tga");
+	Eigen::Matrix4f MVP_shadow = M_Viewport * M_Projection * M_View;
+
+	//rendering the frame buffer
+	{
+		lookat(eye, center, up);
+		viewport(width / 8, height / 8, width * 3 / 4, height * 3 / 4);
+		projection(-1.f/(eye-center).norm());
+		TGAImage image(width, height, TGAImage::RGB);
+		M = M_View;
+		M_IT = (M_Projection * M_View).inverse().transpose();
+		//framebuffer->object coordinates->shadowbuffer
+		M_Shadow = MVP_shadow * ((M_Viewport * M_Projection * M_View).inverse());
+		PhongShader shader;
+		Vec4f screen_coords[3];
+		for (int i = 0; i < model->nfaces(); i++) {
+			for (int j = 0; j < 3; j++) {
+				screen_coords[j] = shader.vertex(i, j);
+			}  
+			triangle(screen_coords, shader, image, zbuffer);
+		}
+
+		image.flip_vertically();
+		image.write_tga_file("diablo_shadow_glow.tga");
+	}
+
 	delete model;
+	delete[] zbuffer;
+	delete[] shadowbuffer;
 	return 0;
 }
